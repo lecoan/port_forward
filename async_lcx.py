@@ -4,7 +4,6 @@ import logging
 import optparse
 
 import sys
-import threading
 
 from chap import CHAP
 
@@ -25,11 +24,11 @@ class Forwarder(object):
         self.p_port = r_port
         self.writer_dict = dict()
         self.main_loop = asyncio.get_event_loop()
-        self.reader_loop = asyncio.new_event_loop()
 
     def run(self):
-        threading.Thread(target=self.reader_thread).start()
-        self.main_loop.run_until_complete(self.start(self.main_loop))
+        self.main_loop.run_until_complete(
+            self.start(self.main_loop)
+        )
 
     async def start(self, loop):
         p_reader, p_writer = await asyncio.open_connection(
@@ -56,19 +55,14 @@ class Forwarder(object):
                 logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
                 self.writer_dict[address] = s_writer
                 writer = s_writer
-                # add new reader task to reader loop
+                # add new reader task to loop
                 asyncio.run_coroutine_threadsafe(
                     self.read(s_reader, p_writer, address),
-                    self.reader_loop
+                    loop
                 )
-            await asyncio.sleep(1)
             writer.write(data['msg'].encode())
             await writer.drain()
             logging.info('send message to control port')
-
-    def reader_thread(self):
-        asyncio.set_event_loop(self.reader_loop)
-        self.reader_loop.run_forever()
 
     async def read(self, reader, writer, address):
         logging.info(f'start new reader task for {address[0]}:{address[1]}')
@@ -79,6 +73,12 @@ class Forwarder(object):
                 raw += temp
                 if len(temp) < MAX_CHAR:
                     break
+            data = {
+                'ip': address[0],
+                'port': address[1],
+                'msg': raw.decode()
+            }
+            raw = json.dumps(data).encode()
             logging.info(f'send {raw} to {address[0]}:{address[1]}')
             writer.write(raw)
             await writer.drain()
@@ -220,8 +220,9 @@ class Listener(object):
 
             await asyncio.sleep(10)
 
-        self.authenticated_set.remove(address[0])
-        logging.info(f'remove {address[0]} from authentication list')
+        if address[0] in self.authenticated_set:
+            self.authenticated_set.remove(address[0])
+            logging.info(f'remove {address[0]} from authentication list')
         writer.close()
 
 

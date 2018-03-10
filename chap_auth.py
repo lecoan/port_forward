@@ -25,7 +25,7 @@ async def chap_auth(lo):
         msg = json.loads(data.decode())
         logging.info(f'receive {data.decode()} from server')
         type_code = msg['code']
-        await asyncio.sleep(10)
+        # await asyncio.sleep(10)
         if type_code == 1:
             string = chap.get_response(USERNAME, msg)
             writer.write(string.encode())
