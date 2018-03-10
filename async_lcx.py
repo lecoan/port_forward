@@ -2,9 +2,10 @@ import asyncio
 import json
 import logging
 import optparse
-import socket
 
 import sys
+import threading
+
 from chap import CHAP
 
 local_storage = {
@@ -12,25 +13,75 @@ local_storage = {
     'test2': '654321'
 }
 
+MAX_CHAR = 1024
+
 
 # python async_lcx.py -m slave -l 127.0.0.1 -p 3000 -r 127.0.0.1 -P 3500
 class Forwarder(object):
     def __init__(self, ip, port, r_ip, r_port):
         self.s_ip = ip
         self.s_port = port
-        self.d_ip = r_ip
-        self.d_port = r_port
+        self.p_ip = r_ip
+        self.p_port = r_port
+        self.writer_dict = dict()
+        self.main_loop = asyncio.get_event_loop()
+        self.reader_loop = asyncio.new_event_loop()
 
     def run(self):
-        d_sk = socket.socket()
-        d_sk.connect((self.d_ip, self.d_port))
-        # s_sk = socket.socket()
-        # s_sk.connect((self.s_ip, self.s_port))
+        threading.Thread(target=self.reader_thread).start()
+        self.main_loop.run_until_complete(self.start(self.main_loop))
+
+    async def start(self, loop):
+        p_reader, p_writer = await asyncio.open_connection(
+            self.p_ip, self.p_port, loop=loop
+        )
+
         while True:
-            data = d_sk.recv(1024)
-            msg = data.decode()
-            print(msg)
-            # s_sk.send(data)
+            raw = b''
+            while True:
+                temp = await p_reader.read(MAX_CHAR)
+                raw += temp
+                if len(temp) < MAX_CHAR:
+                    break
+            logging.info(f'receive message {raw} from server')
+            data = json.loads(raw.decode())
+            ip = data['ip']
+            port = data['port']
+            address = (ip, port)
+            writer = self.writer_dict.get(address)
+            if not writer:
+                s_reader, s_writer = await asyncio.open_connection(
+                    self.s_ip, self.s_port, loop=loop
+                )
+                logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
+                self.writer_dict[address] = s_writer
+                writer = s_writer
+                # add new reader task to reader loop
+                asyncio.run_coroutine_threadsafe(
+                    self.read(s_reader, p_writer, address),
+                    self.reader_loop
+                )
+            await asyncio.sleep(1)
+            writer.write(data['msg'].encode())
+            await writer.drain()
+            logging.info('send message to control port')
+
+    def reader_thread(self):
+        asyncio.set_event_loop(self.reader_loop)
+        self.reader_loop.run_forever()
+
+    async def read(self, reader, writer, address):
+        logging.info(f'start new reader task for {address[0]}:{address[1]}')
+        while True:
+            raw = b''
+            while True:
+                temp = await reader.read(MAX_CHAR)
+                raw += temp
+                if len(temp) < MAX_CHAR:
+                    break
+            logging.info(f'send {raw} to {address[0]}:{address[1]}')
+            writer.write(raw)
+            await writer.drain()
 
 
 # python async_lcx.py -m listen -p 4500 -P 3500
@@ -40,18 +91,24 @@ class Listener(object):
     def __init__(self, s_port, d_port, chap=False, chap_port=0):
         self.s_port = s_port
         self.d_port = d_port
-        self.slave_sk = None
+        self.slave_writer = None
         self.enable_chap = chap
+        self.writer_dict = dict()
         if self.enable_chap:
             self.authenticated_set = set()
             self.chap_port = chap_port
             self.chap = CHAP(local_storage)
 
     def run(self):
-        self.slave_conn()
-
         loop = asyncio.get_event_loop()
         servers = []
+
+        slave_task = asyncio.start_server(
+            self.slave_listen,
+            '127.0.0.1', self.d_port,
+            loop=loop
+        )
+        servers.append(loop.run_until_complete(slave_task))
 
         trans_task = asyncio.start_server(
             self.master_listen,
@@ -59,6 +116,7 @@ class Listener(object):
             loop=loop
         )
         servers.append(loop.run_until_complete(trans_task))
+
         if self.enable_chap:
             logging.info('enable chap')
             auth_task = asyncio.start_server(
@@ -77,36 +135,59 @@ class Listener(object):
                 loop.run_until_complete(server.wait_closed())
             loop.close()
 
-    def slave_conn(self):
-        slave = socket.socket()
-        slave.bind(('127.0.0.1', self.d_port))
-        slave.listen()
-        print(f'waiting for connection at port{self.d_port}')
-        conn, address = slave.accept()
-        print(f'connection at {address[0]}:{address[1]}')
-        self.slave_sk = conn
+    async def slave_listen(self, reader, writer):
+        address = writer.get_extra_info('peername')
+        logging.info(f'slave connected at port{address[1]}')
+        self.slave_writer = writer
+
+        while True:
+            raw = b''
+            while True:
+                temp = await reader.read(MAX_CHAR)
+                raw += temp
+                if 0 < len(temp) < MAX_CHAR:
+                    break
+            logging.info(f'receive {raw} from salve')
+            data = json.loads(raw.decode())
+            address = (data['ip'], data['port'])
+            writer = self.writer_dict.get(address)
+            logging.info(f'send message to {address[0]}:{address[1]}')
+            writer.write(data['msg'].encode())
+            await writer.drain()
 
     async def master_listen(self, reader, writer):
         address = writer.get_extra_info('peername')
         logging.info(f'new connect at {address[0]}:{address[1]}')
+        self.writer_dict[address] = writer
 
         while not self.enable_chap or address[0] in self.authenticated_set:
-            raw = await reader.read(1024)
-            data = json.loads(raw.decode())
-            msg = data['msg']
-            logging.info(f'server received {msg} from {address[0]}')
+            raw = b''
+            while True:
+                temp = await reader.read(MAX_CHAR)
+                raw += temp
+                if MAX_CHAR > len(temp) > 0:
+                    break
+            logging.info(f'server received {raw} from {address[0]}:{address[1]}')
+            msg = raw.decode()
             if msg == 'exit':
                 break
-            self.slave_sk.send(raw)
+            data = {
+                'ip': address[0],
+                'port': address[1],
+                'msg': msg
+            }
+
+            raw = json.dumps(data).encode()
+            self.slave_writer.write(raw)
+            await self.slave_writer.drain()
             logging.info(f'send msg {raw} to slave')
-        data = {
-            'username': 'server',
-            'msg': 'Close connection from server'
-        }
-        writer.write(json.dumps(data).encode())
+
+        raw = 'Close connection from server'.encode()
+        writer.write(raw)
         await writer.drain()
-        logging.info(f'Close connection with {address[0]}')
+        logging.info(f'Close connection with {address[0]}:{address[1]}')
         writer.close()
+        self.writer_dict.pop(address)
 
     async def auth_listen(self, reader, writer):
         address = writer.get_extra_info('peername')
@@ -116,10 +197,17 @@ class Listener(object):
             writer.write(msg.encode())
             await writer.drain()
             logging.info(f'send CHAP challenge to {address[0]}')
-            raw = await reader.read(1024)
+
+            try:
+                raw = await asyncio.wait_for(reader.read(MAX_CHAR), 5)
+            except asyncio.futures.TimeoutError:
+                logging.info(f'auth timeout with {address[0]}, auth FAILED')
+                break
+
             reply = raw.decode()
             data = json.loads(reply)
             reply, auth = self.chap.get_auth_result(data)
+
             if auth:
                 self.authenticated_set.add(address[0])
                 logging.info(f'{address[0]} has been authenticated')
@@ -129,8 +217,11 @@ class Listener(object):
                 writer.write(reply.encode())
                 await writer.drain()
                 break
+
             await asyncio.sleep(10)
+
         self.authenticated_set.remove(address[0])
+        logging.info(f'remove {address[0]} from authentication list')
         writer.close()
 
 
