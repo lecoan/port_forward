@@ -4,8 +4,8 @@ import logging
 
 from chap import CHAP
 
-MASTER_PORT = 4500
 CHAP_PORT = 5500
+HOST_NAME = 'lecoan.me'
 USERNAME = 'test1'
 
 MAX_CHAR = 1024
@@ -18,7 +18,7 @@ local_storage = {
 async def chap_auth(lo):
     chap = CHAP(local_storage)
     reader, writer = await asyncio \
-        .open_connection('127.0.0.1', CHAP_PORT, loop=lo)
+        .open_connection(HOST_NAME, CHAP_PORT, loop=lo)
     logging.info('start CHAP connection')
     while True:
         data = await reader.read(MAX_CHAR)

@@ -43,7 +43,7 @@ class Forwarder(object):
                 if len(temp) < MAX_CHAR:
                     break
             logging.info(f'receive message {raw} from server')
-            data = json.loads(raw.decode())
+            data = json.loads(raw.decode(errors='ignore'))
             ip = data['ip']
             port = data['port']
             address = (ip, port)
@@ -60,7 +60,7 @@ class Forwarder(object):
                     self.read(s_reader, p_writer, address),
                     loop
                 )
-            writer.write(data['msg'].encode())
+            writer.write(data['msg'].encode(errors='ignore'))
             await writer.drain()
             logging.info('send message to control port')
 
@@ -76,9 +76,9 @@ class Forwarder(object):
             data = {
                 'ip': address[0],
                 'port': address[1],
-                'msg': raw.decode()
+                'msg': raw.decode(errors='ignore')
             }
-            raw = json.dumps(data).encode()
+            raw = json.dumps(data).encode(errors='ignore')
             logging.info(f'send {raw} to {address[0]}:{address[1]}')
             writer.write(raw)
             await writer.drain()
@@ -105,14 +105,14 @@ class Listener(object):
 
         slave_task = asyncio.start_server(
             self.slave_listen,
-            '127.0.0.1', self.d_port,
+            '0.0.0.0', self.d_port,
             loop=loop
         )
         servers.append(loop.run_until_complete(slave_task))
 
         trans_task = asyncio.start_server(
             self.master_listen,
-            '127.0.0.1', self.s_port,
+            '0.0.0.0', self.s_port,
             loop=loop
         )
         servers.append(loop.run_until_complete(trans_task))
@@ -121,7 +121,7 @@ class Listener(object):
             logging.info('enable chap')
             auth_task = asyncio.start_server(
                 self.auth_listen,
-                '127.0.0.1', self.chap_port,
+                '0.0.0.0', self.chap_port,
                 loop=loop
             )
             servers.append(loop.run_until_complete(auth_task))
@@ -148,11 +148,11 @@ class Listener(object):
                 if 0 < len(temp) < MAX_CHAR:
                     break
             logging.info(f'receive {raw} from salve')
-            data = json.loads(raw.decode())
+            data = json.loads(raw.decode(errors='ignore'))
             address = (data['ip'], data['port'])
             writer = self.writer_dict.get(address)
             logging.info(f'send message to {address[0]}:{address[1]}')
-            writer.write(data['msg'].encode())
+            writer.write(data['msg'].encode(errors='ignore'))
             await writer.drain()
 
     async def master_listen(self, reader, writer):
@@ -168,7 +168,7 @@ class Listener(object):
                 if MAX_CHAR > len(temp) > 0:
                     break
             logging.info(f'server received {raw} from {address[0]}:{address[1]}')
-            msg = raw.decode()
+            msg = raw.decode(errors='ignore')
             if msg == 'exit':
                 break
             data = {
@@ -177,12 +177,12 @@ class Listener(object):
                 'msg': msg
             }
 
-            raw = json.dumps(data).encode()
+            raw = json.dumps(data).encode(errors='ignore')
             self.slave_writer.write(raw)
             await self.slave_writer.drain()
             logging.info(f'send msg {raw} to slave')
 
-        raw = 'Close connection from server'.encode()
+        raw = 'Close connection from server'.encode(errors='ignore')
         writer.write(raw)
         await writer.drain()
         logging.info(f'Close connection with {address[0]}:{address[1]}')
@@ -194,7 +194,7 @@ class Listener(object):
         logging.info(f'new auth connection at {address[0]}')
         while True:
             msg = self.chap.get_challenge('server')
-            writer.write(msg.encode())
+            writer.write(msg.encode(errors='ignore'))
             await writer.drain()
             logging.info(f'send CHAP challenge to {address[0]}')
 
@@ -204,17 +204,17 @@ class Listener(object):
                 logging.info(f'auth timeout with {address[0]}, auth FAILED')
                 break
 
-            reply = raw.decode()
+            reply = raw.decode(errors='ignore')
             data = json.loads(reply)
             reply, auth = self.chap.get_auth_result(data)
 
             if auth:
                 self.authenticated_set.add(address[0])
                 logging.info(f'{address[0]} has been authenticated')
-                writer.write(reply.encode())
+                writer.write(reply.encode(errors='ignore'))
                 await writer.drain()
             else:
-                writer.write(reply.encode())
+                writer.write(reply.encode(errors='ignore'))
                 await writer.drain()
                 break
 
