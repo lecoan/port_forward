@@ -36,8 +36,10 @@ class Forwarder(object):
         )
 
         while True:
+            print('39 loop')
             raw = b''
             while True:
+                print('42 loop')
                 temp = await p_reader.read(MAX_CHAR)
                 raw += temp
                 if len(temp) < MAX_CHAR:
@@ -55,7 +57,7 @@ class Forwarder(object):
                 logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
                 self.writer_dict[address] = s_writer
                 writer = s_writer
-                # add new reader task to loop
+
                 asyncio.run_coroutine_threadsafe(
                     self.read(s_reader, p_writer, address),
                     loop
@@ -67,12 +69,19 @@ class Forwarder(object):
     async def read(self, reader, writer, address):
         logging.info(f'start new reader task for {address[0]}:{address[1]}')
         while True:
+            print('72 loop')
             raw = b''
             while True:
-                temp = await reader.read(MAX_CHAR)
-                raw += temp
-                if len(temp) < MAX_CHAR:
-                    break
+                print('75 loop')  # TODO
+                try:
+                    temp = await reader.read(MAX_CHAR)
+                    raw += temp
+                    if len(temp) < MAX_CHAR:
+                        break
+                except:
+                    self.writer_dict.pop(address)
+                    logging.info(f'connection with {address[0]}:{address[1]} closed')
+                    return
             data = {
                 'ip': address[0],
                 'port': address[1],
@@ -141,8 +150,10 @@ class Listener(object):
         self.slave_writer = writer
 
         while True:
+            print('153 loop')
             raw = b''
             while True:
+                print('156 loop')
                 temp = await reader.read(MAX_CHAR)
                 raw += temp
                 if 0 < len(temp) < MAX_CHAR:
@@ -163,9 +174,10 @@ class Listener(object):
         while not self.enable_chap or address[0] in self.authenticated_set:
             raw = b''
             while True:
+                print('177 loop')  # TODO
                 temp = await reader.read(MAX_CHAR)
                 raw += temp
-                if MAX_CHAR > len(temp) > 0:
+                if len(temp) < MAX_CHAR:
                     break
             logging.info(f'server received {raw} from {address[0]}:{address[1]}')
             msg = raw.decode(errors='ignore')
@@ -193,6 +205,7 @@ class Listener(object):
         address = writer.get_extra_info('peername')
         logging.info(f'new auth connection at {address[0]}')
         while True:
+            print('208 loop')
             msg = self.chap.get_challenge('server')
             writer.write(msg.encode(errors='ignore'))
             await writer.drain()
