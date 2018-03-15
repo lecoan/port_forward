@@ -16,6 +16,7 @@ MAX_CHAR = 1024
 
 
 # python async_lcx.py -m slave -l 127.0.0.1 -p 3000 -r 127.0.0.1 -P 3500
+# python async_lcx.py -m slave -l 10.3.8.211 -p 80 -r 127.0.0.1 -P 3500
 class Forwarder(object):
     def __init__(self, ip, port, r_ip, r_port):
         self.s_ip = ip
@@ -41,6 +42,9 @@ class Forwarder(object):
             while True:
                 print('42 loop')
                 temp = await p_reader.read(MAX_CHAR)
+                if not temp:
+                    logging.info(f'connection with server closed')
+                    return
                 raw += temp
                 if len(temp) < MAX_CHAR:
                     break
@@ -72,16 +76,15 @@ class Forwarder(object):
             print('72 loop')
             raw = b''
             while True:
-                print('75 loop')  # TODO
-                try:
-                    temp = await reader.read(MAX_CHAR)
-                    raw += temp
-                    if len(temp) < MAX_CHAR:
-                        break
-                except:
+                print('75 loop')
+                temp = await reader.read(MAX_CHAR)
+                if not temp:
                     self.writer_dict.pop(address)
                     logging.info(f'connection with {address[0]}:{address[1]} closed')
                     return
+                raw += temp
+                if len(temp) < MAX_CHAR:
+                    break
             data = {
                 'ip': address[0],
                 'port': address[1],
@@ -155,8 +158,11 @@ class Listener(object):
             while True:
                 print('156 loop')
                 temp = await reader.read(MAX_CHAR)
+                if not temp:
+                    logging.info(f'connection with slave closed')
+                    return
                 raw += temp
-                if 0 < len(temp) < MAX_CHAR:
+                if len(temp) < MAX_CHAR:
                     break
             logging.info(f'receive {raw} from salve')
             data = json.loads(raw.decode(errors='ignore'))
@@ -174,8 +180,11 @@ class Listener(object):
         while not self.enable_chap or address[0] in self.authenticated_set:
             raw = b''
             while True:
-                print('177 loop')  # TODO
+                print('177 loop')
                 temp = await reader.read(MAX_CHAR)
+                if not temp:
+                    logging.info(f'connection with{address[0]}:{address[1]} closed')
+                    return
                 raw += temp
                 if len(temp) < MAX_CHAR:
                     break
