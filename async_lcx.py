@@ -12,7 +12,8 @@ local_storage = {
     'test2': '654321'
 }
 
-MAX_CHAR = 1024
+MAX_CHAR = 512 * 1024
+MAX_PAC = MAX_CHAR + 512
 
 
 # python async_lcx.py -m slave -l 127.0.0.1 -p 3000 -r 127.0.0.1 -P 3500
@@ -37,17 +38,11 @@ class Forwarder(object):
         )
 
         while True:
-            print('39 loop')
-            raw = b''
-            while True:
-                print('42 loop')
-                temp = await p_reader.read(MAX_CHAR)
-                if not temp:
-                    logging.info(f'connection with server closed')
-                    return
-                raw += temp
-                if len(temp) < MAX_CHAR:
-                    break
+            print('42 loop')
+            raw = await p_reader.read(MAX_PAC) # read from server
+            if not raw:
+                logging.info(f'connection with server closed')
+                return
             logging.info(f'receive message {raw} from server')
             data = json.loads(raw.decode(errors='ignore'))
             ip = data['ip']
@@ -73,18 +68,12 @@ class Forwarder(object):
     async def read(self, reader, writer, address):
         logging.info(f'start new reader task for {address[0]}:{address[1]}')
         while True:
-            print('72 loop')
-            raw = b''
-            while True:
-                print('75 loop')
-                temp = await reader.read(MAX_CHAR)
-                if not temp:
-                    self.writer_dict.pop(address)
-                    logging.info(f'connection with {address[0]}:{address[1]} closed')
-                    return
-                raw += temp
-                if len(temp) < MAX_CHAR:
-                    break
+            print('75 loop')
+            raw = await reader.read(MAX_CHAR) # read from client
+            if not raw:
+                self.writer_dict.pop(address)
+                logging.info(f'connection with {address[0]}:{address[1]} closed')
+                return
             data = {
                 'ip': address[0],
                 'port': address[1],
@@ -154,16 +143,12 @@ class Listener(object):
 
         while True:
             print('153 loop')
-            raw = b''
-            while True:
-                print('156 loop')
-                temp = await reader.read(MAX_CHAR)
-                if not temp:
-                    logging.info(f'connection with slave closed')
-                    return
-                raw += temp
-                if len(temp) < MAX_CHAR:
-                    break
+
+            raw = await reader.read(MAX_PAC) # read from slave
+            if not raw:
+                logging.info(f'connection with slave closed')
+                return
+
             logging.info(f'receive {raw} from salve')
             data = json.loads(raw.decode(errors='ignore'))
             address = (data['ip'], data['port'])
@@ -178,16 +163,12 @@ class Listener(object):
         self.writer_dict[address] = writer
 
         while not self.enable_chap or address[0] in self.authenticated_set:
-            raw = b''
-            while True:
-                print('177 loop')
-                temp = await reader.read(MAX_CHAR)
-                if not temp:
-                    logging.info(f'connection with{address[0]}:{address[1]} closed')
-                    return
-                raw += temp
-                if len(temp) < MAX_CHAR:
-                    break
+
+            raw = await reader.read(MAX_PAC) # read from control port
+            if not raw:
+                logging.info(f'connection with{address[0]}:{address[1]} closed')
+                return
+
             logging.info(f'server received {raw} from {address[0]}:{address[1]}')
             msg = raw.decode(errors='ignore')
             if msg == 'exit':
