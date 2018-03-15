@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import optparse
-
+import struct
 import sys
 
 from chap import CHAP
@@ -12,8 +12,15 @@ local_storage = {
     'test2': '654321'
 }
 
-MAX_CHAR = 512 * 1024
+MAX_CHAR = 1024 * 8
 MAX_PAC = MAX_CHAR + 512
+HEAD_SIZE = 4
+
+
+def add_header(raw):
+    header = [raw.__len__()]
+    pack = struct.pack('!1I', *header)
+    return pack + raw
 
 
 # python async_lcx.py -m slave -l 127.0.0.1 -p 3000 -r 127.0.0.1 -P 3500
@@ -36,10 +43,9 @@ class Forwarder(object):
         p_reader, p_writer = await asyncio.open_connection(
             self.p_ip, self.p_port, loop=loop
         )
-
         while True:
             print('42 loop')
-            raw = await p_reader.read(MAX_PAC) # read from server
+            raw = await p_reader.read(MAX_PAC)  # read from server
             if not raw:
                 logging.info(f'connection with server closed')
                 return
@@ -68,8 +74,8 @@ class Forwarder(object):
     async def read(self, reader, writer, address):
         logging.info(f'start new reader task for {address[0]}:{address[1]}')
         while True:
-            print('75 loop')
-            raw = await reader.read(MAX_CHAR) # read from client
+            print('77 loop')
+            raw = await reader.read(MAX_CHAR)  # read from client
             if not raw:
                 self.writer_dict.pop(address)
                 logging.info(f'connection with {address[0]}:{address[1]} closed')
@@ -81,7 +87,8 @@ class Forwarder(object):
             }
             raw = json.dumps(data).encode(errors='ignore')
             logging.info(f'send {raw} to {address[0]}:{address[1]}')
-            writer.write(raw)
+
+            writer.write(add_header(raw))
             await writer.drain()
 
 
@@ -140,22 +147,31 @@ class Listener(object):
         address = writer.get_extra_info('peername')
         logging.info(f'slave connected at port{address[1]}')
         self.slave_writer = writer
-
+        buffer = b''
         while True:
-            print('153 loop')
+            data = await reader.read(1024)
+            if data:
+                buffer += data
+                while True:
+                    if len(buffer) < HEAD_SIZE:
+                        break
 
-            raw = await reader.read(MAX_PAC) # read from slave
-            if not raw:
-                logging.info(f'connection with slave closed')
-                return
+                    pack = struct.unpack('!1I', buffer[:HEAD_SIZE])
+                    body_size = pack[0]
 
-            logging.info(f'receive {raw} from salve')
-            data = json.loads(raw.decode(errors='ignore'))
-            address = (data['ip'], data['port'])
-            writer = self.writer_dict.get(address)
-            logging.info(f'send message to {address[0]}:{address[1]}')
-            writer.write(data['msg'].encode(errors='ignore'))
-            await writer.drain()
+                    if len(buffer) < HEAD_SIZE + body_size:
+                        break
+
+                    raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
+
+                    logging.info(f'receive {raw} from slave')
+                    data = json.loads(raw.decode(errors='ignore'))
+                    address = (data['ip'], data['port'])
+                    writer = self.writer_dict.get(address)
+                    logging.info(f'send message to {address[0]}:{address[1]}')
+                    writer.write(data['msg'].encode(errors='ignore'))
+                    await writer.drain()
+                    buffer = buffer[HEAD_SIZE + body_size:]
 
     async def master_listen(self, reader, writer):
         address = writer.get_extra_info('peername')
@@ -164,7 +180,7 @@ class Listener(object):
 
         while not self.enable_chap or address[0] in self.authenticated_set:
 
-            raw = await reader.read(MAX_PAC) # read from control port
+            raw = await reader.read(MAX_PAC)  # read from control port
             if not raw:
                 logging.info(f'connection with{address[0]}:{address[1]} closed')
                 return
