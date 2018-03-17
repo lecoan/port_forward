@@ -136,7 +136,7 @@ class Forwarder(object):
                     break
 
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
-                logging.info(f'receive message {len(raw)} bytes from server')
+                logging.info(f'receive message {raw} from server')
                 data = json.loads(raw.decode(errors='ignore'))
                 ip = data['ip']
                 port = data['port']
@@ -147,9 +147,7 @@ class Forwarder(object):
                     s_reader, s_writer = await asyncio.open_connection(
                         self.s_ip, self.s_port, loop=loop
                     )
-                    logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
                     self.writer_dict[address] = s_writer
-
                     asyncio.run_coroutine_threadsafe(
                         self.reader(s_reader, p_writer, address),
                         loop
@@ -158,11 +156,12 @@ class Forwarder(object):
                     writer = self.writer_dict.get(address)
                     writer.write(msg.encode(errors='ignore'))
                     await writer.drain()
-                    logging.info('send message to control port')
+                    logging.info(f'send message to control port')
 
                 buffer = buffer[HEAD_SIZE + body_size:]
 
     async def reader(self, reader, writer, address):
+        logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
         stop = False
         while True:
             raw = await reader.read(MAX_CHAR)  # read from client
@@ -180,7 +179,7 @@ class Forwarder(object):
                 'msg': msg
             }
             raw = json.dumps(data).encode(errors='ignore')
-            logging.info(f'send {len(raw)} bytes to {address[0]}:{address[1]}')
+            logging.info(f'send {raw} to {address[0]}:{address[1]}')
 
             writer.write(add_header(raw))
             await writer.drain()
@@ -280,7 +279,7 @@ class Listener(object):
                         break
                     # process data
                     raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
-                    logging.info(f'receive {len(raw)} bytes from slave')
+                    logging.info(f'receive {raw} from slave')
                     data = json.loads(raw.decode(errors='ignore'))
                     address = (data['ip'], data['port'])
 
@@ -321,7 +320,7 @@ class Listener(object):
             if not raw:
                 logging.info(f'connection with{address[0]}:{address[1]} closed')
                 return
-            logging.info(f'server received {len(raw)} bytes from {address[0]}:{address[1]}')
+            logging.info(f'server received {raw} from {address[0]}:{address[1]}')
 
             data = {
                 'ip': address[0],
@@ -331,7 +330,7 @@ class Listener(object):
             raw = json.dumps(data).encode(errors='ignore')
             self.slave_writer.write(add_header(raw))
             await self.slave_writer.drain()
-            logging.info(f'send msg {len(raw)} bytes to slave')
+            logging.info(f'send msg {raw} to slave')
 
 
 if __name__ == '__main__':
