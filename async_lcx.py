@@ -1,20 +1,20 @@
 import asyncio
 import hashlib
-import json
 import logging
 import optparse
 import random
 import struct
+import json
 import sys
 
 MAX_CHAR = 1024 * 8
 MAX_PAC = MAX_CHAR + 512
-HEAD_SIZE = 4
+HEAD_SIZE = 8
 
 
-def add_header(raw):
-    header = [raw.__len__()]
-    pack = struct.pack('!1I', *header)
+def add_header(raw, index):
+    header = [raw.__len__(), index]
+    pack = struct.pack('!2I', *header)
     return pack + raw
 
 
@@ -129,7 +129,7 @@ class Forwarder(object):
             while True:
                 if len(buffer) < HEAD_SIZE:
                     break
-                pack = struct.unpack('!1I', buffer[:HEAD_SIZE])
+                pack = struct.unpack('!2I', buffer[:HEAD_SIZE])
                 body_size = pack[0]
 
                 if len(buffer) < HEAD_SIZE + body_size:
@@ -137,51 +137,41 @@ class Forwarder(object):
 
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
                 logging.info(f'receive message {raw} from server')
-                data = json.loads(raw.decode(errors='ignore'))
-                ip = data['ip']
-                port = data['port']
-                msg = data['msg']
-                address = (ip, port)
+                index = pack[1]
 
-                if msg == '$$new_connection$$' and address not in self.writer_dict:
+                if raw == b'$$new_connection$$':
                     s_reader, s_writer = await asyncio.open_connection(
                         self.s_ip, self.s_port, loop=loop
                     )
-                    self.writer_dict[address] = s_writer
+                    self.writer_dict[index] = s_writer
                     asyncio.run_coroutine_threadsafe(
-                        self.reader(s_reader, p_writer, address),
+                        self.reader(s_reader, p_writer, index),
                         loop
                     )
                 else:
-                    writer = self.writer_dict.get(address)
-                    writer.write(msg.encode(errors='ignore'))
+                    writer = self.writer_dict.get(index)
+                    writer.write(raw)
                     await writer.drain()
                     logging.info(f'send message to control port')
 
                 buffer = buffer[HEAD_SIZE + body_size:]
 
-    async def reader(self, reader, writer, address):
-        logging.info(f'create new reader and writer for {address[0]}:{address[1]}')
+    async def reader(self, reader, writer, index):
+        logging.info(f'create new reader and writer for {index}')
         stop = False
         while True:
             raw = await reader.read(MAX_CHAR)  # read from client
             if not raw:
-                self.writer_dict.pop(address)
-                logging.info(f'connection with {address[0]}:{address[1]} closed')
+                self.writer_dict.pop(index)
+                logging.info(f'connection with {index} closed')
                 stop = True
 
-            msg = raw.decode(errors='ignore')
             if stop:
-                msg = '$$connection_closed$$'
-            data = {
-                'ip': address[0],
-                'port': address[1],
-                'msg': msg
-            }
-            raw = json.dumps(data).encode(errors='ignore')
-            logging.info(f'send {raw} to {address[0]}:{address[1]}')
+                raw = b'$$connection_closed$$'
 
-            writer.write(add_header(raw))
+            logging.info(f'send {raw} to {index}')
+
+            writer.write(add_header(raw, index))
             await writer.drain()
 
             if stop:
@@ -196,6 +186,7 @@ class Listener(object):
         self.d_port = d_port
         self.slave_writer = None
         self.writer_dict = dict()
+        self.index = 0
         try:
             from server_config import config
             self.chap = CHAP(config['database'])
@@ -233,10 +224,9 @@ class Listener(object):
 
     async def slave_listen(self, reader, writer):
         address = writer.get_extra_info('peername')
-        logging.info(f'slave connected at port{address[1]}')
 
         msg = self.chap.get_challenge(self.name)
-        writer.write(msg.encode(errors='ignore'))
+        writer.write(msg.encode())
         await writer.drain()
         logging.info(f'send CHAP challenge to {address[0]}')
 
@@ -247,16 +237,16 @@ class Listener(object):
             writer.close()
             return
 
-        reply = raw.decode(errors='ignore')
+        reply = raw.decode()
         data = json.loads(reply)
         reply, auth = self.chap.get_auth_result(data)
 
         if auth:
             logging.info(f'slave has been authenticated')
-            writer.write(reply.encode(errors='ignore'))
+            writer.write(reply.encode())
             await writer.drain()
         else:
-            writer.write(reply.encode(errors='ignore'))
+            writer.write(reply.encode())
             await writer.drain()
             writer.close()
             logging.info('close connection with slave')
@@ -272,25 +262,24 @@ class Listener(object):
                     if len(buffer) < HEAD_SIZE:
                         break
 
-                    pack = struct.unpack('!1I', buffer[:HEAD_SIZE])
+                    pack = struct.unpack('!2I', buffer[:HEAD_SIZE])
                     body_size = pack[0]
 
                     if len(buffer) < HEAD_SIZE + body_size:
                         break
                     # process data
                     raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
+                    index = pack[1]
                     logging.info(f'receive {raw} from slave')
-                    data = json.loads(raw.decode(errors='ignore'))
-                    address = (data['ip'], data['port'])
 
-                    master_writer = self.writer_dict.get(address)
-                    if data['msg'] == '$$connection_closed$$':
-                        self.writer_dict.pop(address)
+                    master_writer = self.writer_dict.get(index)
+                    if raw == b'$$connection_closed$$':
+                        self.writer_dict.pop(index)
                         master_writer.close()
-                        logging.info(f'close connection with {address[0]}:{address[1]}')
+                        logging.info(f'close connection with {index}')
                     else:
-                        logging.info(f'send message to {address[0]}:{address[1]}')
-                        master_writer.write(data['msg'].encode(errors='ignore'))
+                        logging.info(f'send message to {index}')
+                        master_writer.write(raw)
                         await master_writer.drain()
 
                     buffer = buffer[HEAD_SIZE + body_size:]
@@ -300,35 +289,24 @@ class Listener(object):
                 return
 
     async def master_listen(self, reader, writer):
-        address = writer.get_extra_info('peername')
-        logging.info(f'new connect at {address[0]}:{address[1]}')
-        self.writer_dict[address] = writer
+        index = self.index
+        self.index += 1
+        self.writer_dict[index] = writer
+        logging.info(f'new connect at {index}')
 
-        data = {
-            'ip': address[0],
-            'port': address[1],
-            'msg': '$$new_connection$$'
-        }
-        string = json.dumps(data)
-        raw = string.encode()
-        self.slave_writer.write(add_header(raw))
+        raw = b'$$new_connection$$'
+        self.slave_writer.write(add_header(raw, index))
         await self.slave_writer.drain()
         logging.info(f'send connection request')
 
         while True:
             raw = await reader.read(MAX_PAC)  # read from control port
             if not raw:
-                logging.info(f'connection with{address[0]}:{address[1]} closed')
+                logging.info(f'connection with{index} closed')
                 return
-            logging.info(f'server received {raw} from {address[0]}:{address[1]}')
+            logging.info(f'server received {raw} from {index}')
 
-            data = {
-                'ip': address[0],
-                'port': address[1],
-                'msg': raw.decode(errors='ignore')
-            }
-            raw = json.dumps(data).encode(errors='ignore')
-            self.slave_writer.write(add_header(raw))
+            self.slave_writer.write(add_header(raw, index))
             await self.slave_writer.drain()
             logging.info(f'send msg {raw} to slave')
 
