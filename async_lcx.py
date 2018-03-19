@@ -150,6 +150,7 @@ class Forwarder(object):
                     )
                 else:
                     writer = self.writer_dict.get(index)
+                    await asyncio.sleep(0.1)
                     writer.write(raw)
                     await writer.drain()
                     logging.info(f'send message to control port')
