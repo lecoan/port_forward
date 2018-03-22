@@ -8,7 +8,6 @@ import json
 import sys
 
 MAX_CHAR = 1024 * 8
-MAX_PAC = MAX_CHAR + 512
 HEAD_SIZE = 8
 
 
@@ -121,7 +120,7 @@ class Forwarder(object):
 
         buffer = b''
         while True:
-            raw = await p_reader.read(MAX_PAC)  # read from server
+            raw = await p_reader.read(MAX_CHAR)  # read from server
             if not raw:
                 logging.info(f'connection with server closed')
                 return
@@ -136,7 +135,7 @@ class Forwarder(object):
                     break
 
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
-                logging.info(f'receive message {raw} from server')
+                logging.info(f'receive message {len(raw)} bytes from server')
                 index = pack[1]
 
                 if raw == b'$$new_connection$$':
@@ -150,7 +149,6 @@ class Forwarder(object):
                     )
                 else:
                     writer = self.writer_dict.get(index)
-                    await asyncio.sleep(0.1)
                     writer.write(raw)
                     await writer.drain()
                     logging.info(f'send message to control port')
@@ -170,7 +168,7 @@ class Forwarder(object):
             if stop:
                 raw = b'$$connection_closed$$'
 
-            logging.info(f'send {raw} to {index}')
+            logging.info(f'send {len(raw)} bytes to {index}')
 
             writer.write(add_header(raw, index))
             await writer.drain()
@@ -256,7 +254,7 @@ class Listener(object):
         self.slave_writer = writer
         buffer = b''
         while True:
-            data = await reader.read(MAX_PAC)
+            data = await reader.read(MAX_CHAR)
             if data:
                 buffer += data
                 while True:
@@ -271,7 +269,7 @@ class Listener(object):
                     # process data
                     raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
                     index = pack[1]
-                    logging.info(f'receive {raw} from slave')
+                    logging.info(f'receive {len(raw)} bytes from slave')
 
                     master_writer = self.writer_dict.get(index)
                     if raw == b'$$connection_closed$$':
@@ -301,15 +299,15 @@ class Listener(object):
         logging.info(f'send connection request')
 
         while True:
-            raw = await reader.read(MAX_PAC)  # read from control port
+            raw = await reader.read(MAX_CHAR)  # read from control port
             if not raw:
                 logging.info(f'connection with{index} closed')
                 return
-            logging.info(f'server received {raw} from {index}')
+            logging.info(f'server received {len(raw)} bytes from {index}')
 
             self.slave_writer.write(add_header(raw, index))
             await self.slave_writer.drain()
-            logging.info(f'send msg {raw} to slave')
+            logging.info(f'send msg {len(raw)} bytes to slave')
 
 
 if __name__ == '__main__':
