@@ -5,6 +5,7 @@ import optparse
 import random
 import struct
 import sys
+import threading
 
 MAX_CHAR = 1024 * 8
 HEAD_SIZE = 3
@@ -45,11 +46,10 @@ def get_chap_response(username, password, raw):
 
 def get_chap_result(raw, storage, salt):
     name_len = raw[0]
-    username = raw[:name_len + 1]
-    hash_val = raw[name_len + 1:]
+    username = raw[1:name_len + 1].decode()
+    hash_val = raw[name_len + 2:].decode()
     password = storage.get(username)
     md5 = create_nonce(password + salt)
-
     res = 0
     if md5 == hash_val:
         res = 1
@@ -65,9 +65,9 @@ def get_chap_salt():
 
 
 class Forwarder(object):
-    def __init__(self, l_ip, l_port, r_ip, r_port, port, username, password):
-        self.local = (l_ip, l_port)
-        self.remote = (r_ip, r_port)
+    def __init__(self, local, remote, port, username, password):
+        self.local = local
+        self.remote = remote
         self.port = port
         self.writer_dict = dict() # {conn_id: writer}
         self.loop = asyncio.get_event_loop()
@@ -82,7 +82,7 @@ class Forwarder(object):
     async def start(self):
         loop = self.loop
         reader, writer = await asyncio.open_connection(
-            self.remote[0], self.remote[1], loop
+            self.remote[0], self.remote[1], loop=loop
         )
         buffer = b''
         while True:
@@ -99,7 +99,6 @@ class Forwarder(object):
                 if len(buffer) < HEAD_SIZE + body_size:
                     break
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
-                logging.info(f'receive message {len(raw)} bytes from server')
 
                 await self.dispatch(writer, raw, pack[1])
 
@@ -108,7 +107,7 @@ class Forwarder(object):
     async def dispatch(self, r_writer, raw, type):
         if type == CHAP_SALT:
             raw = get_chap_response(self.name, self.pwd, raw)
-            logging.info(f'send {raw} to  server')
+            logging.info(f'send {len(raw)} to  server')
             r_writer.write(add_header(raw, CHAP_HASH))
             await r_writer.drain()
 
@@ -121,8 +120,10 @@ class Forwarder(object):
             logging.info('CHAP passed')
             raw = struct.pack('!H', self.port)
             r_writer.write(add_header(raw, BIND_REQ))
+            logging.info('send BIND_REQ')
 
         elif type == BIND_RES:
+            logging.info('recv BIND_RES')
             result, port = struct.unpack('!BH', raw)
             if not result:
                 pass
@@ -130,59 +131,71 @@ class Forwarder(object):
                 self.port = port
 
         elif type == CONN_REQ:
-            conn_id = struct.unpack('!H', raw)
-            # TODO add try catch
-            l_reader, l_writer = await asyncio.open_connection(
-                self.local[0], self.local[1], loop=self.loop
-            )
-            self.writer_dict[conn_id] = l_writer
-            asyncio.run_coroutine_threadsafe(
-                self.reader(l_reader, r_writer, conn_id),
-                self.loop
-            )
-            self.writer_dict[conn_id] = l_writer
-            raw = struct.pack('!BH', 1, conn_id)
+            (conn_id, ) = struct.unpack('!H', raw)
+            result = 1
+            try:
+                l_reader, l_writer = await asyncio.open_connection(
+                    self.local[0], self.local[1], loop=self.loop
+                )
+                self.writer_dict[conn_id] = l_writer
+                print(141, self.writer_dict.keys())
+                asyncio.run_coroutine_threadsafe(
+                    self.reader(l_reader, r_writer, conn_id),
+                    self.loop
+                )
+            except OSError:
+                result = 0
+            raw = struct.pack('!BH', result, conn_id)
             r_writer.write(add_header(raw, CONN_RES))
             await r_writer.drain()
+            logging.info('send CONN_RES')
 
         elif type == DATA:
-            conn_id = struct.unpack('!H', raw[:2])
+            (conn_id, ) = struct.unpack('!H', raw[:2])
+            print(155, self.writer_dict.keys())
             writer = self.writer_dict.get(conn_id)
-            writer.write(raw[2:])
+            raw = raw[2:]
+            writer.write(raw)
             await writer.drain()
-            logging.info(f'send message to control port')
+            logging.info(f'send {raw} to local server')
 
         elif type == DIS_CONN:
-            conn_id = struct.unpack('!H', raw)
-            writer = self.writer_dict[conn_id]
-            writer.close()
-            logging.info(f'close connection with {conn_id}')
+            (conn_id, ) = struct.unpack('!H', raw)
+            if conn_id in self.writer_dict:
+                writer = self.writer_dict.pop(conn_id)
+                writer.close()
+            logging.info(f'recv DIS_CONN: conn_id:{conn_id}')
         else:
             pass
 
     async def reader(self, reader, writer, conn_id):
-        logging.info(f'create new reader and writer for {conn_id}')
+        logging.info(f'CREATE new reader and writer for {conn_id}')
         while True:
             raw = await reader.read(MAX_CHAR)  # read from client
             if not raw:
-                self.writer_dict.pop(conn_id)
-                logging.info(f'connection with {conn_id} closed')
+                self.writer_dict.pop(conn_id).close()
+                logging.info(f'send DIS_CONN: conn_id:{conn_id}')
                 writer.write(add_header(struct.pack('!H', conn_id), DIS_CONN))
                 await writer.drain()
+                return
 
-            logging.info(f'send {len(raw)} bytes to {conn_id}')
-
+            logging.info(f'send DATA: {len(raw)} TO {conn_id}')
+            raw = struct.pack('!H', conn_id) + raw
             writer.write(add_header(raw, DATA))
             await writer.drain()
 
 
-# python async_lcx.py -m listen -p 4500 -P 3500
+def kill_conn(writer):
+    writer.close()
+    logging.info('CHAP timeout, close connection')
+
+
 class Listener(object):
 
     def __init__(self, port, user_dict):
         self.s_port = port
-        self.slave_writer_dict = dict()  # {port: writer}
-        self.master_writer_dict = dict() # {port: {conn_id: writer}}
+        self.slave_writer_dict = dict()  # {port: nwriter}
+        self.master_writer_dict = dict()  # {port: {conn_id: writer}} port --> req bind
         self.user_dict = user_dict  # {name: pwd}
         self.loop = asyncio.get_event_loop()
         self.conn_id = 0
@@ -208,14 +221,14 @@ class Listener(object):
             self.loop.close()
 
     async def slave_listen(self, reader, writer):
-        address = writer.get_extra_info('peername')
-
+        s_addr = writer.get_extra_info('peername')
         raw, salt = get_chap_salt()
         writer.write(add_header(raw, CHAP_SALT))
         await writer.drain()
-        logging.info(f'send CHAP challenge to {address[0]}')
-        # TODO add timer
+        logging.info(f'send CHAP challenge to {s_addr[0]}:{s_addr[1]}')
+        timer = threading.Timer(10, kill_conn, args=[writer])
 
+        bind_port = 0
         buffer = b''
         while True:
             data = await reader.read(MAX_CHAR)
@@ -239,54 +252,59 @@ class Listener(object):
                 type = pack[1]
                 if type == CHAP_HASH:
                     reply, auth = get_chap_result(raw, self.user_dict, salt)
+                    writer.write(add_header(raw, CHAP_RESULT))
+                    await writer.drain()
                     if auth:
                         logging.info(f'slave has been authenticated')
-                        # TODO cancel timer
-                        writer.write(reply)
-                        await writer.drain()
+                        timer.cancel()
                     else:
-                        writer.write(reply)
-                        await writer.drain()
                         writer.close()
                         logging.info('close connection with slave')
                         return
 
                 elif type == BIND_REQ:
-                    port = struct.unpack('!H', raw)
-                    master_task = asyncio.start_server(
+                    logging.info('recv BIND_REQ')
+                    (port, ) = struct.unpack('!H', raw)
+                    server = await asyncio.start_server(
                         self.master_listen,
                         '0.0.0.0', port,
                         loop=self.loop
                     )
-                    # TODO try catch for bind failure
-                    server = self.loop.run_until_complete(master_task)
-                    port = server.sockets[0].getsockname()[1]
-                    self.slave_writer_dict[port] = writer
-                    raw = struct.pack('!BH', 1, port)
+                    result = 1
+                    try:
+                        bind_port = server.sockets[0].getsockname()[1]
+                        # bind_port = port
+                        self.slave_writer_dict[bind_port] = writer
+                    except OSError:
+                        result = 0
+                    raw = struct.pack('!BH', result, bind_port)
                     writer.write(add_header(raw, BIND_RES))
+                    logging.info(f'send BIND_RES -->result:{result}')
                     await writer.drain()
 
                 elif type == CONN_RES:
+                    logging.info('recv CONN_RES')
                     result, conn_id = struct.unpack('!BH', raw)
-                    if result:
-                        # TODO add master_writer
-                        self.master_writer_dict[address[1]][conn_id] = master_writer
-                    else:
-                        pass
+                    if not result:
+                        self.master_writer_dict[bind_port].pop(conn_id)
+
                 elif type == DATA:
-                    if writer not in self.slave_writer_dict:
+                    if bind_port not in self.slave_writer_dict:
+                        print(self.slave_writer_dict)
                         writer.close()
                         return
-                    conn_id = struct.unpack('!H', raw[: 2])
-                    logging.info(f'receive {len(raw)} bytes from slave')
-                    master_writer = self.master_writer_dict[address[1]][conn_id]
+                    (conn_id, ) = struct.unpack('!H', raw[: 2])
+                    master_writer = self.master_writer_dict[bind_port][conn_id]
                     logging.info(f'send message to {conn_id}')
+                    raw = raw[2:]
+                    logging.info(f'receive {len(raw)} from slave')
                     master_writer.write(raw)
                     await master_writer.drain()
 
                 elif type == DIS_CONN:
-                    conn_id = struct.unpack('!H', raw)
-                    self.master_writer_dict[address[1]].pop(conn_id)
+                    logging.info('recv DIS_CONN')
+                    (conn_id, ) = struct.unpack('!H', raw)
+                    master_writer = self.master_writer_dict[bind_port].pop(conn_id)
                     master_writer.close()
                     logging.info(f'close connection with {conn_id}')
                 else:
@@ -295,33 +313,37 @@ class Listener(object):
                 buffer = buffer[HEAD_SIZE + body_size:]
 
     async def master_listen(self, reader, writer):
-        # TODO change to sockname
-        address = writer.get_extra_info('peername')
-        logging.info(f'new connect at {address[0]}:{address[1]}')
+        ip, port = writer.get_extra_info('sockname')
+        logging.info(f'new connect at {port}')
 
-        slave_writer = self.slave_writer_dict.get(address[1])
+        slave_writer = self.slave_writer_dict.get(port)
         conn_id = self.conn_id
         raw = struct.pack('!H', conn_id)
         self.conn_id += 1
+        if port not in self.master_writer_dict:
+            self.master_writer_dict[port] = dict()
+        self.master_writer_dict[port][conn_id] = writer
         slave_writer.write(add_header(raw, CONN_REQ))
         await slave_writer.drain()
-        logging.info(f'send connection request')
+        logging.info(f'send CONN_REQ')
 
         while True:
-            raw = await reader.read(MAX_CHAR)  # read from control port
+            raw = await reader.read(MAX_CHAR)  # read from remote client
+            print(raw)
             if not raw:
                 logging.info(f'connection with{conn_id} closed')
                 raw = struct.pack('!H', conn_id)
                 slave_writer.write(add_header(raw, DIS_CONN))
                 await slave_writer.drain()
                 return
-            logging.info(f'server received {len(raw)} bytes from {conn_id}')
+            logging.info(f'server received {len(raw)} from {conn_id}')
             raw = struct.pack('!H', conn_id) + raw
             slave_writer.write(add_header(raw, DATA))
             await slave_writer.drain()
-            logging.info(f'send msg {len(raw)} bytes to slave')
+            logging.info(f'send msg {len(raw)} to slave')
 
 
+# TODO slave master diff
 def parse_user(s_users):
     user_list = s_users.split(',')
     if len(user_list) == 1:
@@ -331,6 +353,12 @@ def parse_user(s_users):
         username, password = user.split(':')
         user_dict[username] = password
     return user_dict
+
+
+def parse_address(local, remote):
+    l_ip, l_port = local.split(':')
+    r_ip, r_port = remote.split(':')
+    return (l_ip, l_port), (r_ip, r_port)
 
 
 if __name__ == '__main__':
@@ -371,9 +399,9 @@ if __name__ == '__main__':
 
     elif opts.mode == 'slave':
         username, password = parse_user(opts.users)
+        local, remote = parse_address(opts.local, opts.remote)
         Forwarder(
-            opts.local_ip, opts.local_port,
-            opts.remote_ip, opts.remote_port,
+            local, remote,
             opts.port, username, password
         ).run()
     else:
