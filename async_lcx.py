@@ -5,20 +5,32 @@ import optparse
 import random
 import struct
 import sys
-import threading
+
 
 MAX_CHAR = 1024 * 8
+# 消息格式 --> |message length: 2B | type: 1B| body |
 HEAD_SIZE = 3
 
+# | salt length: 1B | slat |
 CHAP_SALT = b'A'
+# | name length: 1B | name | hash length: 1B | hash |
 CHAP_HASH = b'B'
+# | result: 1B |
 CHAP_RESULT = b'C'
+# | port: 2B |
 BIND_REQ = b'D'
+# | result: 1B | port: 2B |
 BIND_RES = b'E'
+# | conn_id: 2B |
 CONN_REQ = b'F'
+# | result: 1B | conn_id: 2B |
 CONN_RES = b'G'
+# | conn_id: 2B | data |
 DATA = b'H'
+# | conn_id: 2B |
 DIS_CONN = b'I'
+# None
+HEARTBEATS = b'J'
 
 
 def add_header(raw, type):
@@ -64,6 +76,14 @@ def get_chap_salt():
     return pack + raw, salt
 
 
+async def send_beats(writer):
+    while True:
+        await asyncio.sleep(3)
+        writer.write(add_header(b'', HEARTBEATS))
+        await writer.drain()
+        logging.info('send HEARTBEATS')
+
+
 class Forwarder(object):
     def __init__(self, local, remote, port, username, password):
         self.local = local
@@ -99,6 +119,8 @@ class Forwarder(object):
                     logging.info('CANNOT CONNECT to remote, exiting...')
                     exit()
 
+        beats = asyncio.run_coroutine_threadsafe(send_beats(writer), loop=loop)
+
         buffer = b''
         while True:
             raw = await reader.read(MAX_CHAR)  # read from server
@@ -106,6 +128,7 @@ class Forwarder(object):
                 logging.info(f'connection with server closed')
                 for l_writer in self.writer_dict.values():
                     l_writer.close()
+                    beats.cancel()
                 return
             buffer += raw
             while True:
@@ -125,6 +148,7 @@ class Forwarder(object):
         if type == CHAP_SALT:
             logging.info('recv CHAP_SALT')
             raw = get_chap_response(self.name, self.pwd, raw)
+            # await asyncio.sleep(10)
             logging.info(f'send CHAP_HASH')
             r_writer.write(add_header(raw, CHAP_HASH))
             await r_writer.drain()
@@ -137,6 +161,7 @@ class Forwarder(object):
                 exit()
             raw = struct.pack('!H', self.port)
             r_writer.write(add_header(raw, BIND_REQ))
+            await r_writer.drain()
             logging.info(f'send BIND_REQ --> port:{self.port}')
 
         elif type == BIND_RES:
@@ -212,9 +237,10 @@ class Forwarder(object):
             await writer.drain()
 
 
-def kill_conn(writer):
+async def kill_conn(writer, msg):
+    await asyncio.sleep(5)
     writer.close()
-    logging.info('CHAP timeout, close connection')
+    logging.info(msg)
 
 
 class Listener(object):
@@ -226,6 +252,7 @@ class Listener(object):
         self.user_dict = user_dict  # {name: pwd}
         self.loop = asyncio.get_event_loop()
         self.conn_id = 0
+        self.conn_future = dict()  # {conn_id: future} 超时断开
 
     def run(self):
         servers = []
@@ -248,12 +275,17 @@ class Listener(object):
             self.loop.close()
 
     async def slave_listen(self, reader, writer):
-        s_addr = writer.get_extra_info('peername')
         raw, salt = get_chap_salt()
         writer.write(add_header(raw, CHAP_SALT))
         await writer.drain()
-        logging.info(f'send CHAP challenge to {s_addr[0]}:{s_addr[1]}')
-        timer = threading.Timer(10, kill_conn, args=[writer])
+        logging.info(f'send CHAP_SALT')
+        chap_future = asyncio.run_coroutine_threadsafe(kill_conn(
+            writer, 'CHAP timeout, close connection'
+        ), loop=self.loop)
+
+        beats_future = asyncio.run_coroutine_threadsafe(kill_conn(
+            writer, 'HEARTBEATS TIMEOUT, close connection'
+        ), loop=self.loop)
 
         bind_port = 0
         buffer = b''
@@ -262,6 +294,7 @@ class Listener(object):
             if not data:
                 logging.info(f'close connection with slave')
                 writer.close()
+                beats_future.cancel()
                 return
 
             buffer += data
@@ -284,9 +317,8 @@ class Listener(object):
                     writer.write(add_header(reply, CHAP_RESULT))
                     await writer.drain()
                     logging.info(f'send CHAP_RESULT --> result:{auth}')
-                    if auth:
-                        timer.cancel()
-                    else:
+                    chap_future.cancel()
+                    if not auth:
                         writer.close()
                         return
 
@@ -315,6 +347,7 @@ class Listener(object):
                     if not result:
                         writer = self.master_writer_dict[bind_port].pop(conn_id)
                         writer.close()
+                    self.conn_future.pop(conn_id).cancel()
 
                 elif type == DATA:
                     if bind_port not in self.slave_writer_dict:
@@ -333,6 +366,12 @@ class Listener(object):
                     master_writer = self.master_writer_dict[bind_port].pop(conn_id)
                     master_writer.close()
 
+                elif type == HEARTBEATS:
+                    logging.info('recv HEARTBEATS')
+                    beats_future.cancel()
+                    beats_future = asyncio.run_coroutine_threadsafe(kill_conn(
+                        writer, 'HEARTBEATS TIMEOUT, close connection'
+                    ), loop=self.loop)
                 else:
                     logging.info('recv UNKNOWN --> CLOSE connection')
                     ids = self.master_writer_dict[bind_port].keys()
@@ -362,6 +401,9 @@ class Listener(object):
         slave_writer.write(add_header(raw, CONN_REQ))
         await slave_writer.drain()
         logging.info(f'send CONN_REQ --> conn_id:{conn_id}')
+        self.conn_future[conn_id] = asyncio.run_coroutine_threadsafe(kill_conn(
+            writer, f'CONN_RES TIMEOUT, close connection --> conn_id:{conn_id}'
+        ), loop=self.loop)
 
         while True:
             raw = await reader.read(MAX_CHAR)  # read from remote client
