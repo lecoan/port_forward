@@ -69,7 +69,7 @@ class Forwarder(object):
         self.local = local
         self.remote = remote
         self.port = port
-        self.writer_dict = dict() # {conn_id: writer}
+        self.writer_dict = dict()  # {conn_id: writer}
         self.loop = asyncio.get_event_loop()
         self.name = username
         self.pwd = password
@@ -81,14 +81,31 @@ class Forwarder(object):
 
     async def start(self):
         loop = self.loop
-        reader, writer = await asyncio.open_connection(
-            self.remote[0], self.remote[1], loop=loop
-        )
+
+        count = 0
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(
+                    self.remote[0], self.remote[1], loop=loop
+                )
+                break
+            except OSError:
+                count += 1
+                if count < 5:
+                    logging.info('CONNECT to remote FAILED, try again')
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    logging.info('CANNOT CONNECT to remote, exiting...')
+                    exit()
+
         buffer = b''
         while True:
             raw = await reader.read(MAX_CHAR)  # read from server
             if not raw:
                 logging.info(f'connection with server closed')
+                for l_writer in self.writer_dict.values():
+                    l_writer.close()
                 return
             buffer += raw
             while True:
@@ -106,39 +123,41 @@ class Forwarder(object):
 
     async def dispatch(self, r_writer, raw, type):
         if type == CHAP_SALT:
+            logging.info('recv CHAP_SALT')
             raw = get_chap_response(self.name, self.pwd, raw)
-            logging.info(f'send {len(raw)} to  server')
+            logging.info(f'send CHAP_HASH')
             r_writer.write(add_header(raw, CHAP_HASH))
             await r_writer.drain()
 
         elif type == CHAP_RESULT:
-            result = raw[0]
+            (result,) = struct.unpack('!B', raw)
+            logging.info(f'recv CHAP_RESULT --> result:{result}')
             if not result:
-                logging.info('closed connection')
                 r_writer.close()
                 exit()
-            logging.info('CHAP passed')
             raw = struct.pack('!H', self.port)
             r_writer.write(add_header(raw, BIND_REQ))
-            logging.info('send BIND_REQ')
+            logging.info(f'send BIND_REQ --> port:{self.port}')
 
         elif type == BIND_RES:
-            logging.info('recv BIND_RES')
             result, port = struct.unpack('!BH', raw)
+            logging.info(f'recv BIND_RES --> result:{result} port:{port}')
             if not result:
-                pass
+                logging.info('bind FAILED, please try another port')
+                r_writer.close()
+                exit()
             else:
                 self.port = port
 
         elif type == CONN_REQ:
-            (conn_id, ) = struct.unpack('!H', raw)
+            (conn_id,) = struct.unpack('!H', raw)
+            logging.info(f'recv CONN_REQ --> conn_id:{conn_id}')
             result = 1
             try:
                 l_reader, l_writer = await asyncio.open_connection(
                     self.local[0], self.local[1], loop=self.loop
                 )
                 self.writer_dict[conn_id] = l_writer
-                print(141, self.writer_dict.keys())
                 asyncio.run_coroutine_threadsafe(
                     self.reader(l_reader, r_writer, conn_id),
                     self.loop
@@ -148,25 +167,33 @@ class Forwarder(object):
             raw = struct.pack('!BH', result, conn_id)
             r_writer.write(add_header(raw, CONN_RES))
             await r_writer.drain()
-            logging.info('send CONN_RES')
+            logging.info(f'send CONN_RES --> result:{result} conn_id:{conn_id}')
 
         elif type == DATA:
-            (conn_id, ) = struct.unpack('!H', raw[:2])
-            print(155, self.writer_dict.keys())
+            (conn_id,) = struct.unpack('!H', raw[:2])
             writer = self.writer_dict.get(conn_id)
             raw = raw[2:]
+            logging.info(f'recv DATA --> conn_id:{conn_id} data:{len(raw)} bytes')
             writer.write(raw)
             await writer.drain()
-            logging.info(f'send {raw} to local server')
 
         elif type == DIS_CONN:
-            (conn_id, ) = struct.unpack('!H', raw)
+            (conn_id,) = struct.unpack('!H', raw)
             if conn_id in self.writer_dict:
                 writer = self.writer_dict.pop(conn_id)
                 writer.close()
             logging.info(f'recv DIS_CONN: conn_id:{conn_id}')
+
         else:
-            pass
+            logging.info('RECV UNKNOWN message, CLOSE connection')
+            for conn_id in self.writer_dict.keys():
+                raw = struct.pack('!H', conn_id)
+                r_writer.write(add_header(raw, DIS_CONN))
+                await r_writer.drain()
+            for writer in self.writer_dict.values():
+                writer.close()
+            r_writer.close()
+            exit()
 
     async def reader(self, reader, writer, conn_id):
         logging.info(f'CREATE new reader and writer for {conn_id}')
@@ -251,64 +278,73 @@ class Listener(object):
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
                 type = pack[1]
                 if type == CHAP_HASH:
+                    logging.info(f'recv CHAP_HASH')
                     reply, auth = get_chap_result(raw, self.user_dict, salt)
-                    writer.write(add_header(raw, CHAP_RESULT))
+
+                    writer.write(add_header(reply, CHAP_RESULT))
                     await writer.drain()
+                    logging.info(f'send CHAP_RESULT --> result:{auth}')
                     if auth:
-                        logging.info(f'slave has been authenticated')
                         timer.cancel()
                     else:
                         writer.close()
-                        logging.info('close connection with slave')
                         return
 
                 elif type == BIND_REQ:
-                    logging.info('recv BIND_REQ')
-                    (port, ) = struct.unpack('!H', raw)
-                    server = await asyncio.start_server(
-                        self.master_listen,
-                        '0.0.0.0', port,
-                        loop=self.loop
-                    )
+                    (port,) = struct.unpack('!H', raw)
+                    logging.info(f'recv BIND_REQ --> port:{port}')
                     result = 1
                     try:
+                        server = await asyncio.start_server(
+                            self.master_listen,
+                            '0.0.0.0', port,
+                            loop=self.loop
+                        )
                         bind_port = server.sockets[0].getsockname()[1]
-                        # bind_port = port
                         self.slave_writer_dict[bind_port] = writer
                     except OSError:
                         result = 0
                     raw = struct.pack('!BH', result, bind_port)
                     writer.write(add_header(raw, BIND_RES))
-                    logging.info(f'send BIND_RES -->result:{result}')
+                    logging.info(f'send BIND_RES --> result:{result} port:{port}')
                     await writer.drain()
 
                 elif type == CONN_RES:
-                    logging.info('recv CONN_RES')
                     result, conn_id = struct.unpack('!BH', raw)
+                    logging.info(f'recv CONN_RES --> result:{result} conn_id:{conn_id}')
                     if not result:
-                        self.master_writer_dict[bind_port].pop(conn_id)
+                        writer = self.master_writer_dict[bind_port].pop(conn_id)
+                        writer.close()
 
                 elif type == DATA:
                     if bind_port not in self.slave_writer_dict:
-                        print(self.slave_writer_dict)
                         writer.close()
                         return
-                    (conn_id, ) = struct.unpack('!H', raw[: 2])
+                    (conn_id,) = struct.unpack('!H', raw[: 2])
                     master_writer = self.master_writer_dict[bind_port][conn_id]
-                    logging.info(f'send message to {conn_id}')
                     raw = raw[2:]
-                    logging.info(f'receive {len(raw)} from slave')
+                    logging.info(f'recv DATA --> conn_id:{conn_id} data:{len(raw)} bytes')
                     master_writer.write(raw)
                     await master_writer.drain()
 
                 elif type == DIS_CONN:
-                    logging.info('recv DIS_CONN')
-                    (conn_id, ) = struct.unpack('!H', raw)
+                    (conn_id,) = struct.unpack('!H', raw)
+                    logging.info(f'recv DIS_CONN --> conn_id:{conn_id}')
                     master_writer = self.master_writer_dict[bind_port].pop(conn_id)
                     master_writer.close()
-                    logging.info(f'close connection with {conn_id}')
+
                 else:
-                    pass
+                    logging.info('recv UNKNOWN --> CLOSE connection')
+                    ids = self.master_writer_dict[bind_port].keys()
+                    for conn_id in ids:
+                        raw = struct.pack('!H', conn_id)
+                        writer.write(add_header(raw, DIS_CONN))
+                        await writer.drain()
+                    writer.close()
+                    writers = self.master_writer_dict[bind_port].values()
+                    for writer in writers:
+                        writer.close()
+                    return
 
                 buffer = buffer[HEAD_SIZE + body_size:]
 
@@ -325,34 +361,32 @@ class Listener(object):
         self.master_writer_dict[port][conn_id] = writer
         slave_writer.write(add_header(raw, CONN_REQ))
         await slave_writer.drain()
-        logging.info(f'send CONN_REQ')
+        logging.info(f'send CONN_REQ --> conn_id:{conn_id}')
 
         while True:
             raw = await reader.read(MAX_CHAR)  # read from remote client
-            print(raw)
             if not raw:
-                logging.info(f'connection with{conn_id} closed')
                 raw = struct.pack('!H', conn_id)
                 slave_writer.write(add_header(raw, DIS_CONN))
                 await slave_writer.drain()
+                logging.info(f'send DIS_CONN --> conn_id:{conn_id}')
                 return
-            logging.info(f'server received {len(raw)} from {conn_id}')
+            logging.info(f'send DATA --> conn_id:{conn_id} data:{len(raw)} bytes')
             raw = struct.pack('!H', conn_id) + raw
             slave_writer.write(add_header(raw, DATA))
             await slave_writer.drain()
-            logging.info(f'send msg {len(raw)} to slave')
 
 
-# TODO slave master diff
-def parse_user(s_users):
-    user_list = s_users.split(',')
-    if len(user_list) == 1:
+def parse_user(s_users, listen):
+    if listen:
+        user_list = s_users.split(',')
+        user_dict = dict()
+        for user in user_list:
+            username, password = user.split(':')
+            user_dict[username] = password
+        return user_dict
+    else:
         return s_users.split(':')
-    user_dict = dict()
-    for user in user_list:
-        username, password = user.split(':')
-        user_dict[username] = password
-    return user_dict
 
 
 def parse_address(local, remote):
@@ -391,14 +425,14 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(name)-11s: %(message)s')
 
     if opts.mode == 'listen':
-        users = parse_user(opts.users)
+        users = parse_user(opts.users, True)
         Listener(
             opts.port,
             users
         ).run()
 
     elif opts.mode == 'slave':
-        username, password = parse_user(opts.users)
+        username, password = parse_user(opts.users, False)
         local, remote = parse_address(opts.local, opts.remote)
         Forwarder(
             local, remote,
