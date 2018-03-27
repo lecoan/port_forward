@@ -7,6 +7,14 @@ import struct
 import sys
 
 
+'''
+- 支持多Slave、多Cient同时连接
+- 加入心跳包，超时断开连接
+- 支持CHAP、CONN_REQ等报文的超时处理
+- 支持为Slave随机绑定端口
+- 收到未知消息则清理相应连接
+'''
+
 MAX_CHAR = 1024 * 8
 # 消息格式 --> |message length: 2B | type: 1B| body |
 HEAD_SIZE = 3
@@ -33,16 +41,19 @@ DIS_CONN = b'I'
 HEARTBEATS = b'J'
 
 
+# 为报文加上消息长度、类型的标记
 def add_header(raw, type):
     header = [raw.__len__(), type]
     pack = struct.pack('!Hc', *header)
     return pack + raw
 
 
+# 创建随机salt
 def create_nonce(msg):
     return hashlib.sha224(msg.encode()).hexdigest()
 
 
+# CHAP相关函数
 def get_chap_response(username, password, raw):
     username = username.encode()
     name_len = len(username)
@@ -84,12 +95,13 @@ async def send_beats(writer):
         logging.info('send HEARTBEATS')
 
 
+# Slave相关的类
 class Forwarder(object):
     def __init__(self, local, remote, port, username, password):
         self.local = local
         self.remote = remote
-        self.port = port
-        self.writer_dict = dict()  # {conn_id: writer}
+        self.port = port  # 要绑定的端口
+        self.writer_dict = dict()  # 结构：{conn_id: writer for local server}
         self.loop = asyncio.get_event_loop()
         self.name = username
         self.pwd = password
@@ -102,6 +114,7 @@ class Forwarder(object):
     async def start(self):
         loop = self.loop
 
+        # 连接Remote Listen失败自动重连
         count = 0
         while True:
             try:
@@ -119,12 +132,13 @@ class Forwarder(object):
                     logging.info('CANNOT CONNECT to remote, exiting...')
                     exit()
 
+        # 定时发送心跳包
         beats = asyncio.run_coroutine_threadsafe(send_beats(writer), loop=loop)
 
         buffer = b''
         while True:
-            raw = await reader.read(MAX_CHAR)  # read from server
-            if not raw:
+            raw = await reader.read(MAX_CHAR)  # read from remote listen
+            if not raw:  # 收到EOF, 说明连接断开 
                 logging.info(f'connection with server closed')
                 for l_writer in self.writer_dict.values():
                     l_writer.close()
@@ -138,8 +152,9 @@ class Forwarder(object):
                 body_size = pack[0]
                 if len(buffer) < HEAD_SIZE + body_size:
                     break
+                # 获取报文内容
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
-
+                # 根据报文类型进行相应处理
                 await self.dispatch(writer, raw, pack[1])
 
                 buffer = buffer[HEAD_SIZE + body_size:]
@@ -220,6 +235,7 @@ class Forwarder(object):
             r_writer.close()
             exit()
 
+    # 从Local Server一直读消息并转发给Remote Listen
     async def reader(self, reader, writer, conn_id):
         logging.info(f'CREATE new reader and writer for {conn_id}')
         while True:
@@ -236,7 +252,7 @@ class Forwarder(object):
             writer.write(add_header(raw, DATA))
             await writer.drain()
 
-
+# 在5秒超时后关掉writer对应的连接
 async def kill_conn(writer, msg):
     await asyncio.sleep(5)
     writer.close()
@@ -247,8 +263,8 @@ class Listener(object):
 
     def __init__(self, port, user_dict):
         self.s_port = port
-        self.slave_writer_dict = dict()  # {port: nwriter}
-        self.master_writer_dict = dict()  # {port: {conn_id: writer}} port --> req bind
+        self.slave_writer_dict = dict()  # {bind_port: writer for slave}
+        self.master_writer_dict = dict()  # {port for slave : {conn_id: writer for remote client}} port --> req bind
         self.user_dict = user_dict  # {name: pwd}
         self.loop = asyncio.get_event_loop()
         self.conn_id = 0
@@ -257,8 +273,9 @@ class Listener(object):
     def run(self):
         servers = []
 
+        # 创建server监听slave的连接
         slave_task = asyncio.start_server(
-            self.slave_listen,
+            self.slave_listen,  # 处理slave连接的函数
             '0.0.0.0', self.s_port,
             loop=self.loop
         )
@@ -274,15 +291,19 @@ class Listener(object):
                 self.loop.run_until_complete(server.wait_closed())
             self.loop.close()
 
+    # 处理Local Slave和 Remote Listen之间的消息
     async def slave_listen(self, reader, writer):
+        # 连接后立刻发送CHAP_SALT
         raw, salt = get_chap_salt()
         writer.write(add_header(raw, CHAP_SALT))
         await writer.drain()
         logging.info(f'send CHAP_SALT')
+        # 创建CHAP定时器
         chap_future = asyncio.run_coroutine_threadsafe(kill_conn(
             writer, 'CHAP timeout, close connection'
         ), loop=self.loop)
-
+        
+        #创建HEARTBEATS定时器
         beats_future = asyncio.run_coroutine_threadsafe(kill_conn(
             writer, 'HEARTBEATS TIMEOUT, close connection'
         ), loop=self.loop)
@@ -303,13 +324,14 @@ class Listener(object):
                     break
 
                 pack = struct.unpack('!Hc', buffer[:HEAD_SIZE])
-                body_size = pack[0]
+                body_size = pack[0]  # 消息长度
 
                 if len(buffer) < HEAD_SIZE + body_size:
                     break
 
                 raw = buffer[HEAD_SIZE:HEAD_SIZE + body_size]
                 type = pack[1]
+                # dispatch package
                 if type == CHAP_HASH:
                     logging.info(f'recv CHAP_HASH')
                     reply, auth = get_chap_result(raw, self.user_dict, salt)
@@ -327,6 +349,7 @@ class Listener(object):
                     logging.info(f'recv BIND_REQ --> port:{port}')
                     result = 1
                     try:
+                        # 为Slave绑定端口，设为0则制定随机端口
                         server = await asyncio.start_server(
                             self.master_listen,
                             '0.0.0.0', port,
@@ -368,11 +391,13 @@ class Listener(object):
 
                 elif type == HEARTBEATS:
                     logging.info('recv HEARTBEATS')
+                    # 重新启动超时定时器
                     beats_future.cancel()
                     beats_future = asyncio.run_coroutine_threadsafe(kill_conn(
                         writer, 'HEARTBEATS TIMEOUT, close connection'
                     ), loop=self.loop)
                 else:
+                    # 收到未知消息，清理所有连接
                     logging.info('recv UNKNOWN --> CLOSE connection')
                     ids = self.master_writer_dict[bind_port].keys()
                     for conn_id in ids:
@@ -387,11 +412,15 @@ class Listener(object):
 
                 buffer = buffer[HEAD_SIZE + body_size:]
 
+    #remote client连入的处理函数
     async def master_listen(self, reader, writer):
+        # 获取client连接到listen的端口
         ip, port = writer.get_extra_info('sockname')
         logging.info(f'new connect at {port}')
 
+        # 根据端口找到对应salve的writer
         slave_writer = self.slave_writer_dict.get(port)
+        # 由Listen生成conn_id, 由Slave进行确认
         conn_id = self.conn_id
         raw = struct.pack('!H', conn_id)
         self.conn_id += 1
@@ -401,6 +430,7 @@ class Listener(object):
         slave_writer.write(add_header(raw, CONN_REQ))
         await slave_writer.drain()
         logging.info(f'send CONN_REQ --> conn_id:{conn_id}')
+        # 为CONN_REQ设置超时定时器
         self.conn_future[conn_id] = asyncio.run_coroutine_threadsafe(kill_conn(
             writer, f'CONN_RES TIMEOUT, close connection --> conn_id:{conn_id}'
         ), loop=self.loop)
